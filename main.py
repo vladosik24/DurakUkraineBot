@@ -8,7 +8,7 @@ import random
 import os
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
+from aiogram.filters import Command, Text
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram import F
 import asyncio
@@ -136,6 +136,7 @@ class DurakGame:
             defender_hand.append(self.deck.pop())
     
     def game_over(self):
+        # Визначає переможця, якщо колода закінчилася і у кого немає карт
         if not self.deck:
             if not self.player1_hand:
                 return self.player1_id
@@ -145,12 +146,12 @@ class DurakGame:
     
     def make_bot_move_smart(self, attacker=True):
         bot_hand = self.player2_hand
-        
+
         if attacker:
             valid = self.get_valid_attacks(bot_hand)
             if not valid or len(self.table) >= 6:
                 return None
-            
+
             if self.difficulty == "easy":
                 return random.choice(valid)
             else:
@@ -325,11 +326,14 @@ async def handle_create_room(callback: types.CallbackQuery):
     )
     await callback.answer("Кімнату створено! Поділіться командою з другом")
 
-@dp.message(F.text & F.text.startswith(" join"))
-asvnc def cmd_ioin_room (message: types.Message):
-    room_id = message.text.split("_", 1)[1]
-    
-    if room_id not in rooms:
+@dp.message(Text(startswith="/join_"))
+async def cmd_join_room(message: types.Message):
+    # Беремо перший токен (щоб ігнорувати додаткові пробіли), видаляємо можливий @BotUsername
+    token = message.text.strip().split()[0]
+    room_part = token.split("_", 1)[1] if "_" in token else ""
+    room_id = room_part.split("@", 1)[0]
+
+    if not room_id or room_id not in rooms:
         await message.answer("❌ Кімната не знайдена або вже зайнята")
         return
     
@@ -366,7 +370,7 @@ asvnc def cmd_ioin_room (message: types.Message):
             parse_mode="Markdown"
         )
         await send_game_state_multiplayer(room.creator_id, room.game)
-    except:
+    except Exception:
         pass
     
     # Повідомляємо того хто приєднався
@@ -562,7 +566,7 @@ async def send_game_state_multiplayer(chat_id, game, message=""):
     """Для multiplayer гри"""
     player_hand = game.get_hand(chat_id)
     opponent_id = game.get_opponent_id(chat_id)
-    opponent_hand = game.get_hand(opponent_id)
+    opponent_hand = game.get_hand(opponent_id) if opponent_id is not None else []
     opponent_name = game.player2_name if chat_id == game.player1_id else game.player1_name
     
     status = f"🃏 **Гра 'Дурак'** (з другом)\n\n"
@@ -743,7 +747,8 @@ async def handle_game_over(chat_id, game, winner_id):
         ]
         
         await bot.send_message(chat_id, message, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard), parse_mode="Markdown")
-        del games[chat_id]
+        if chat_id in games:
+            del games[chat_id]
 
 @dp.callback_query(F.data.startswith("attack_"))
 async def handle_attack(callback: types.CallbackQuery):
