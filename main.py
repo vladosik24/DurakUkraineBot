@@ -1,594 +1,315 @@
+""" DurakUkraineBot — main.py
+
+Потрібні файли та інструкції (вклади у репозиторій):
+
+requirements.txt: pyTelegramBotAPI==4.20.0
+
+Procfile: worker: python main.py
+
+
+Перед деплоєм на Render.com додайте в Environment variables:
+
+BOT_TOKEN = <токен від @BotFather>
+
+
+--- Короткий опис --- Цей файл реалізує Telegram-бота для гри "Дурак (підкидний)" з підтримкою:
+
+режимів: 1 на 1 та мульти (2-4 гравці)
+
+інлайн-кнопок для гри (показ руки, підкидання, захист, взяти)
+
+повідомленнями українською
+
+карти як текст: '10♠', 'A♥' і т.д.
+
+
+--- Обмеження/Примітки ---
+
+Правила спрощені для зрозумілості: у ходу атакує тільки один гравець; інші гравці (окрім захисника) не підкидають одночасно.
+
+Повна ідеальна симуляція підкидного (коли кілька атакуючих підкидають в один хід) може бути додана в наступному оновленні.
+
+
 """
-Telegram бот для гри "Дурак" - РОЗШИРЕНА ВЕРСІЯ
-Функції: multiplayer, статистика, турніри, режими гри, AI
-"""
 
-import logging
-import random
-import os
-from datetime import datetime
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram import F
-import asyncio
+import os import random import logging import telebot from telebot import types
 
-logging.basicConfig(level=logging.INFO)
+Налаштування логування
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN не знайдено!")
+logging.basicConfig(level=logging.INFO) logger = logging.getLogger(name)
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+Токен з ENV
 
-SUITS = ['♠️', '♥️', '♦️', '♣️']
-RANKS = ['6', '7', '8', '9', '10', 'В', 'Д', 'К', 'Т']
-RANK_VALUES = {'6': 6, '7': 7, '8': 8, '9': 9, '10': 10, 'В': 11, 'Д': 12, 'К': 13, 'Т': 14}
+BOT_TOKEN = os.getenv('BOT_TOKEN', 'YOUR_TELEGRAM_BOT_TOKEN') bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
+
+Карти
+
+SUITS = ['♠', '♥', '♦', '♣'] RANKS = ['6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A'] MAX_HAND = 6
+
+Ігри зберігаються по chat_id
 
 games = {}
-stats = {}
 
-class Card:
-    def __init__(self, rank, suit):
-        self.rank = rank
-        self.suit = suit
-        self.value = RANK_VALUES[rank]
-    
-    def __str__(self):
-        return f"{self.rank}{self.suit}"
+--- Утиліти для карт ---
 
-class PlayerStats:
-    def __init__(self, user_id, username):
-        self.user_id = user_id
-        self.username = username
-        self.games_played = 0
-        self.wins = 0
-        self.losses = 0
-        self.rating = 1000
-        self.achievements = []
-    
-    def win(self):
-        self.wins += 1
-        self.games_played += 1
-        self.rating += 25
-        self._check_achievements()
-    
-    def lose(self):
-        self.losses += 1
-        self.games_played += 1
-        self.rating = max(0, self.rating - 15)
-    
-    def _check_achievements(self):
-        if self.wins == 1 and "first_win" not in self.achievements:
-            self.achievements.append("first_win")
-        if self.wins == 10 and "veteran" not in self.achievements:
-            self.achievements.append("veteran")
-        if self.wins == 50 and "master" not in self.achievements:
-            self.achievements.append("master")
+def create_deck(): return [r + s for s in SUITS for r in RANKS]
 
-class DurakGame:
-    def __init__(self, player1_id, mode="podkidnoy", difficulty="medium"):
-        self.player1_id = player1_id
-        self.mode = mode
-        self.difficulty = difficulty
-        
-        self.deck = [Card(r, s) for s in SUITS for r in RANKS]
-        random.shuffle(self.deck)
-        
-        self.trump_card = self.deck.pop()
-        self.trump_suit = self.trump_card.suit
-        self.deck.insert(0, self.trump_card)
-        
-        self.player1_hand = [self.deck.pop() for _ in range(6)]
-        self.player2_hand = [self.deck.pop() for _ in range(6)]
-        
-        self.table = []
-        self.current_attacker = player1_id
-        self.stage = "attack"
-        
-    def can_beat(self, attacking_card, defending_card):
-        if defending_card.suit == attacking_card.suit:
-            return defending_card.value > attacking_card.value
-        return defending_card.suit == self.trump_suit
-    
-    def get_valid_attacks(self, hand):
-        if not self.table:
-            return hand
-        
-        table_ranks = set()
-        for attack, defend in self.table:
-            table_ranks.add(attack.rank)
-            if defend:
-                table_ranks.add(defend.rank)
-        
-        return [c for c in hand if c.rank in table_ranks]
-    
-    def refill_hands(self):
-        while len(self.player1_hand) < 6 and self.deck:
-            self.player1_hand.append(self.deck.pop())
-        while len(self.player2_hand) < 6 and self.deck:
-            self.player2_hand.append(self.deck.pop())
-    
-    def game_over(self):
-        if not self.deck:
-            if not self.player1_hand:
-                return self.player1_id
-            if not self.player2_hand:
-                return "bot"
-        return None
-    
-    def make_bot_move_smart(self, attacker=True):
-        bot_hand = self.player2_hand
-        
-        if attacker:
-            valid = self.get_valid_attacks(bot_hand)
-            if not valid or len(self.table) >= 6:
-                return None
-            
-            if self.difficulty == "easy":
-                return random.choice(valid)
+def card_rank(card): # повертає індекс рангу r = card[:-1] return RANKS.index(r)
+
+def card_suit(card): return card[-1]
+
+--- Клас гри ---
+
+class DurakGame: def init(self, chat_id, max_players=2): self.chat_id = chat_id self.players = []  # список dict: {id, name, hand} self.max_players = max_players self.deck = [] self.trump = None self.trump_card = None self.attacker_idx = 0 self.defender_idx = 1 self.table = []  # список пар (attack_card, defend_card_or_None) self.started = False
+
+def add_player(self, user):
+    if self.started:
+        return False, 'Гра вже почалась'
+    if any(p['id'] == user.id for p in self.players):
+        return False, 'Ти вже в лобі'
+    if len(self.players) >= self.max_players:
+        return False, 'Лобі повне'
+    self.players.append({'id': user.id, 'name': user.first_name, 'hand': []})
+    return True, 'Додано'
+
+def remove_player(self, user_id):
+    self.players = [p for p in self.players if p['id'] != user_id]
+
+def start(self):
+    # старт гри — тасує, роздає, встановлює козир
+    self.deck = create_deck()
+    random.shuffle(self.deck)
+    # остання карта визначає козир (виберемо останню)
+    self.trump_card = self.deck[-1]
+    self.trump = card_suit(self.trump_card)
+
+    # роздати по MAX_HAND
+    for _ in range(MAX_HAND):
+        for p in self.players:
+            if self.deck:
+                p['hand'].append(self.deck.pop(0))
+    self.started = True
+    self.attacker_idx = 0
+    self.defender_idx = 1 % len(self.players)
+    self.table = []
+
+def get_player_by_id(self, user_id):
+    for p in self.players:
+        if p['id'] == user_id:
+            return p
+    return None
+
+def deal_to_player(self, p):
+    while len(p['hand']) < MAX_HAND and self.deck:
+        p['hand'].append(self.deck.pop(0))
+
+def refill_all(self):
+    # після ходу, кожному по черзі добираємо до 6
+    order = list(range(self.attacker_idx, self.attacker_idx + len(self.players)))
+    for i in order:
+        idx = i % len(self.players)
+        self.deal_to_player(self.players[idx])
+
+def next_turn(self):
+    # пересунути індекси
+    self.attacker_idx = (self.attacker_idx + 1) % len(self.players)
+    self.defender_idx = (self.attacker_idx + 1) % len(self.players)
+    self.table = []
+
+def is_player_turn_attacker(self, user_id):
+    return self.players[self.attacker_idx]['id'] == user_id
+
+def is_player_turn_defender(self, user_id):
+    return self.players[self.defender_idx]['id'] == user_id
+
+def play_attack(self, user_id, card):
+    # атакувати — додаємо карту на стіл
+    p = self.get_player_by_id(user_id)
+    if not p:
+        return False, 'Ти не в грі'
+    if not self.is_player_turn_attacker(user_id):
+        return False, 'Не твій хід атакувати'
+    if card not in p['hand']:
+        return False, 'У тебе немає такої карти'
+    # обмеження: кількість атак не більше MAX_HAND та не більше ніж у захисника
+    if len(self.table) >= MAX_HAND:
+        return False, 'Максимум атак досягнуто'
+    p['hand'].remove(card)
+    self.table.append([card, None])
+    return True, 'Зіграно'
+
+def play_defend(self, user_id, attack_card, defend_card):
+    # захисник намагається побити конкретну карту
+    if not self.is_player_turn_defender(user_id):
+        return False, 'Ти не захисник'
+    p = self.get_player_by_id(user_id)
+    if defend_card not in p['hand']:
+        return False, 'У тебе немає такої карти'
+    # знайти відповідний рядок у таблиці
+    for row in self.table:
+        if row[0] == attack_card and row[1] is None:
+            # можна побити: якщо та ж масть і більший ранг або козир проти некозирки
+            if can_beat(attack_card, defend_card, self.trump):
+                p['hand'].remove(defend_card)
+                row[1] = defend_card
+                return True, 'Побито'
             else:
-                non_trumps = [c for c in valid if c.suit != self.trump_suit]
-                return min(non_trumps, key=lambda x: x.value) if non_trumps else min(valid, key=lambda x: x.value)
+                return False, 'Ця карта не б'є'
+    return False, 'На столі немає такої атаки або вона вже побита'
+
+def take_cards(self, user_id):
+    # захисник бере всі карти зі столу
+    if not self.is_player_turn_defender(user_id):
+        return False, 'Ти не захисник'
+    p = self.get_player_by_id(user_id)
+    # забираємо всі карти, які наразі на столі (атакуючі і оборонні)
+    for a, d in self.table:
+        p['hand'].append(a)
+        if d:
+            p['hand'].append(d)
+    self.table = []
+    # захисник добирає після взяття (разом з іншими гравцями — після завершення ходу викликається refill)
+    return True, 'Взяв карти'
+
+def all_attacks_beaten(self):
+    # перевірити чи всі атаковані карти побиті
+    if not self.table:
+        return True
+    return all(d is not None for a, d in self.table)
+
+def get_table_text(self):
+    if not self.table:
+        return 'Порожній стіл.'
+    rows = []
+    for a, d in self.table:
+        if d:
+            rows.append(f"{a} → {d}")
         else:
-            for i, (attack, defend) in enumerate(self.table):
-                if defend is None:
-                    valid_defends = [c for c in bot_hand if self.can_beat(attack, c)]
-                    if valid_defends:
-                        non_trumps = [c for c in valid_defends if c.suit != self.trump_suit]
-                        card = min(non_trumps, key=lambda x: x.value) if non_trumps else min(valid_defends, key=lambda x: x.value)
-                        return (i, card)
-                    else:
-                        return None
-            return "all_defended"
+            rows.append(f"{a} → _")
+    return '\n'.join(rows)
 
-def get_or_create_stats(user_id, username):
-    if user_id not in stats:
-        stats[user_id] = PlayerStats(user_id, username or "Гравець")
-    return stats[user_id]
+--- Логіка бою карт ---
 
-def get_leaderboard():
-    return sorted(stats.values(), key=lambda x: x.rating, reverse=True)[:10]
+def can_beat(attack_card, defend_card, trump): # повертає True якщо defend_card б'є attack_card a_rank = card_rank(attack_card) d_rank = card_rank(defend_card) a_suit = card_suit(attack_card) d_suit = card_suit(defend_card) if d_suit == a_suit and d_rank > a_rank: return True # якщо захисник козир і атакуючий не козир if d_suit == trump and a_suit != trump: return True return False
 
-def format_hand(cards):
-    return " ".join([str(card) for card in cards])
+--- Хелпери для UI ---
 
-def format_table(table):
-    if not table:
-        return "Стіл порожній"
-    result = []
-    for attack, defend in table:
-        result.append(f"{attack} ← {defend}" if defend else f"{attack} ← ?")
-    return "\n".join(result)
+def hand_keyboard(player): kb = types.InlineKeyboardMarkup() # кожна карта — окрема кнопка buttons = [types.InlineKeyboardButton(text=c, callback_data=f'card:{c}') for c in player['hand']] # розбити на рядки по 4 row = [] for i, b in enumerate(buttons, 1): row.append(b) if i % 4 == 0: kb.row(*row) row = [] if row: kb.row(*row) return kb
 
-def create_card_keyboard(cards, action_prefix):
-    keyboard = []
-    row = []
-    for i, card in enumerate(cards):
-        row.append(InlineKeyboardButton(text=str(card), callback_data=f"{action_prefix}_{i}"))
-        if len(row) == 4:
-            keyboard.append(row)
-            row = []
-    if row:
-        keyboard.append(row)
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+def action_keyboard(game: DurakGame, user_id): kb = types.InlineKeyboardMarkup() # Доступні дії залежать від ролі if game.is_player_turn_attacker(user_id): kb.add(types.InlineKeyboardButton('Підкинути карту', callback_data='action:attack')) kb.add(types.InlineKeyboardButton('Завершити хід', callback_data='action:end_attack')) elif game.is_player_turn_defender(user_id): kb.add(types.InlineKeyboardButton('Захищатись (вибрати карту)', callback_data='action:defend')) kb.add(types.InlineKeyboardButton('Взяти карти', callback_data='action:take')) else: kb.add(types.InlineKeyboardButton('Дивитись свою руку', callback_data='action:hand')) return kb
 
-def get_main_menu():
-    keyboard = [
-        [
-            InlineKeyboardButton(text="🎮 Гра з ботом", callback_data="play_bot"),
-            InlineKeyboardButton(text="📊 Статистика", callback_data="my_stats")
-        ],
-        [
-            InlineKeyboardButton(text="🏆 Рейтинг", callback_data="leaderboard"),
-            InlineKeyboardButton(text="❓ Правила", callback_data="help")
-        ]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+--- Команди ---
 
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    get_or_create_stats(message.from_user.id, message.from_user.username)
-    await message.answer(
-        "🃏 **Вітаю в грі 'Дурак'!**\n\nОберіть режим гри:",
-        reply_markup=get_main_menu(),
-        parse_mode="Markdown"
-    )
+@bot.message_handler(commands=['start']) def cmd_start(message): chat_id = message.chat.id # створити нову гру-лобі з дефолтним макс гравців =2 (будемо давати вибір) games[chat_id] = DurakGame(chat_id, max_players=2) bot.send_message(chat_id, '🃏 Лобі створено!\nНапишіть /join щоб приєднатись.\n\nЯкщо хочете гру до 4 гравців - використайте /setmode 4')
 
-@dp.message(Command("menu"))
-async def cmd_menu(message: types.Message):
-    await message.answer("🎮 **Головне меню:**", reply_markup=get_main_menu(), parse_mode="Markdown")
+@bot.message_handler(commands=['setmode']) def cmd_setmode(message): chat_id = message.chat.id args = message.text.split() if len(args) < 2: bot.send_message(chat_id, 'Вкажіть кількість гравців: /setmode 2 або /setmode 4') return try: n = int(args[1]) if n not in (2, 3, 4): raise ValueError except: bot.send_message(chat_id, 'Допустимі значення: 2, 3, 4') return g = games.get(chat_id) if not g: g = DurakGame(chat_id, max_players=n) games[chat_id] = g else: if g.started: bot.send_message(chat_id, 'Гра вже почалась — не можна міняти режим') return g.max_players = n bot.send_message(chat_id, f'Режим встановлено: до {n} гравців')
 
-@dp.callback_query(F.data == "play_bot")
-async def handle_play_bot(callback: types.CallbackQuery):
-    keyboard = [
-        [InlineKeyboardButton(text="🟢 Легкий", callback_data="bot_easy")],
-        [InlineKeyboardButton(text="🟡 Середній", callback_data="bot_medium")],
-        [InlineKeyboardButton(text="🔴 Важкий", callback_data="bot_hard")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_menu")]
-    ]
-    await callback.message.edit_text(
-        "🤖 **Оберіть складність бота:**",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
-        parse_mode="Markdown"
-    )
-    await callback.answer()
+@bot.message_handler(commands=['join']) def cmd_join(message): chat_id = message.chat.id user = message.from_user g = games.get(chat_id) if not g: g = DurakGame(chat_id, max_players=2) games[chat_id] = g ok, msg = g.add_player(user) if not ok: bot.send_message(chat_id, msg) return bot.send_message(chat_id, f'✅ {user.first_name} приєднався. ({len(g.players)}/{g.max_players})') if len(g.players) == g.max_players: bot.send_message(chat_id, 'Лобі повне — використайте /begin щоб розпочати гру або чекати поки хтось інший не підключиться')
 
-@dp.callback_query(F.data.startswith("bot_"))
-async def handle_bot_difficulty(callback: types.CallbackQuery):
-    difficulty = callback.data.split("_")[1]
-    
-    chat_id = callback.message.chat.id
-    games[chat_id] = DurakGame(callback.from_user.id, difficulty=difficulty)
-    
-    await callback.message.delete()
-    await send_game_state(chat_id, games[chat_id])
-    await callback.answer()
+@bot.message_handler(commands=['leave']) def cmd_leave(message): chat_id = message.chat.id user = message.from_user g = games.get(chat_id) if not g: bot.send_message(chat_id, 'Немає активного лобі') return g.remove_player(user.id) bot.send_message(chat_id, f'{user.first_name} вийшов з лобі')
 
-@dp.callback_query(F.data == "my_stats")
-async def handle_my_stats(callback: types.CallbackQuery):
-    user_stats = get_or_create_stats(callback.from_user.id, callback.from_user.username)
-    
-    winrate = (user_stats.wins / user_stats.games_played * 100) if user_stats.games_played > 0 else 0
-    
-    text = f"""
-📊 **Ваша статистика:**
+@bot.message_handler(commands=['begin']) def cmd_begin(message): chat_id = message.chat.id g = games.get(chat_id) if not g: bot.send_message(chat_id, 'Спочатку створіть лобі /start') return if len(g.players) < 2: bot.send_message(chat_id, 'Потрібно щонайменше 2 гравці щоб почати') return g.start() # повідомити чат bot.send_message(chat_id, f"🎮 Гра почалась! Козир: {g.trump_card}.\nАтакує: {g.players[g.attacker_idx]['name']} — Захисник: {g.players[g.defender_idx]['name']}") # розіслати руки приватно for p in g.players: try: bot.send_message(p['id'], f"🃏 Твоя рука: {', '.join(p['hand'])}") bot.send_message(p['id'], 'Вибери дію:', reply_markup=action_keyboard(g, p['id'])) except Exception as e: logger.exception('Не вдалося надіслати приватне повідомлення')
 
-👤 {user_stats.username}
-🎮 Ігор: {user_stats.games_played}
-✅ Перемог: {user_stats.wins}
-❌ Поразок: {user_stats.losses}
-📈 Winrate: {winrate:.1f}%
-⭐ Рейтинг: {user_stats.rating}
+@bot.message_handler(commands=['hand']) def cmd_hand(message): # показати руку гравцю (приватне повідомлення) user = message.from_user for g in games.values(): p = g.get_player_by_id(user.id) if p: try: bot.send_message(user.id, f"🃏 Твоя рука: {', '.join(p['hand'])}", reply_markup=hand_keyboard(p)) except: bot.send_message(message.chat.id, 'Не вдалось надіслати особисте повідомлення — запустіть чат зі мною і натисніть Start') return bot.send_message(message.chat.id, 'Ти не в грі')
 
-🏅 Досягнення: {len(user_stats.achievements)}
-"""
-    
-    keyboard = [[InlineKeyboardButton(text="🔙 Назад", callback_data="back_menu")]]
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard), parse_mode="Markdown")
-    await callback.answer()
+--- Обробка callback (інлайн кнопок) ---
 
-@dp.callback_query(F.data == "leaderboard")
-async def handle_leaderboard(callback: types.CallbackQuery):
-    top_players = get_leaderboard()
-    
-    if not top_players:
-        await callback.answer("Рейтинг порожній", show_alert=True)
-        return
-    
-    text = "🏆 **ТОП-10 ГРАВЦІВ:**\n\n"
-    medals = ["🥇", "🥈", "🥉"]
-    for i, player in enumerate(top_players):
-        medal = medals[i] if i < 3 else f"{i+1}."
-        winrate = (player.wins / player.games_played * 100) if player.games_played > 0 else 0
-        text += f"{medal} **{player.username}** - {player.rating} ⭐\n   ({player.wins}W/{player.losses}L, {winrate:.0f}%)\n\n"
-    
-    keyboard = [[InlineKeyboardButton(text="🔙 Назад", callback_data="back_menu")]]
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard), parse_mode="Markdown")
-    await callback.answer()
+@bot.callback_query_handler(func=lambda c: True) def callback_handler(call: types.CallbackQuery): data = call.data user = call.from_user chat_id = call.message.chat.id
 
-@dp.callback_query(F.data == "help")
-async def handle_help(callback: types.CallbackQuery):
-    rules = """
-🃏 **Правила гри 'Дурак'**
+# знайти гру, в якій бере участь цей користувач
+game = None
+for g in games.values():
+    if g.get_player_by_id(user.id):
+        game = g
+        break
+if not game:
+    bot.answer_callback_query(call.id, 'Ти не в грі або сесія закінчена')
+    return
 
-**Мета:** Позбутися всіх карт.
-
-**Правила:**
-• Колода: 36 карт (6-Т)
-• Визначається козирна масть
-• Атакуючий кладе карту
-• Захисник бʼє старшою або козирем
-• Можна підкидати карти того ж номіналу
-
-**Складність:**
-🟢 Легкий - бот грає випадково
-🟡 Середній - бот економить карти
-🔴 Важкий - бот використовує стратегію
-
-**Команди:**
-/menu - головне меню
-/stats - ваша статистика
-"""
-    keyboard = [[InlineKeyboardButton(text="🔙 Назад", callback_data="back_menu")]]
-    await callback.message.edit_text(rules, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard), parse_mode="Markdown")
-    await callback.answer()
-
-@dp.callback_query(F.data == "back_menu")
-async def handle_back_menu(callback: types.CallbackQuery):
-    await callback.message.edit_text("🃏 **Головне меню:**", reply_markup=get_main_menu(), parse_mode="Markdown")
-    await callback.answer()
-
-async def send_game_state(chat_id, game, message=""):
-    difficulty_emoji = {"easy": "🟢", "medium": "🟡", "hard": "🔴"}
-    
-    status = f"🃏 **Гра 'Дурак'**\n"
-    status += f"🤖 Складність: {difficulty_emoji.get(game.difficulty, '')} {game.difficulty.upper()}\n\n"
-    status += f"🎴 Козир: {game.trump_card}\n"
-    status += f"📚 Карт у колоді: {len(game.deck)}\n\n"
-    status += f"**На столі:**\n{format_table(game.table)}\n\n"
-    status += f"🤖 Карт у бота: {len(game.player2_hand)}\n"
-    status += f"👤 Ваші карти: {format_hand(game.player1_hand)}\n\n"
-    
-    if message:
-        status += f"📢 {message}\n\n"
-    
-    keyboard = None
-    is_attacker = game.current_attacker == game.player1_id
-    
-    if is_attacker and game.stage == "attack":
-        status += "⚔️ **Ваш хід - атакуйте!**"
-        valid_cards = game.get_valid_attacks(game.player1_hand)
-        if valid_cards:
-            keyboard = create_card_keyboard(valid_cards, "attack")
-            keyboard.inline_keyboard.append([InlineKeyboardButton(text="✅ Завершити хід", callback_data="end_attack")])
-    
-    elif not is_attacker and game.stage == "defend":
-        status += "🛡️ **Захищайтесь!**"
-        undefended = None
-        for i, (attack, defend) in enumerate(game.table):
-            if defend is None:
-                undefended = (i, attack)
-                break
-        
-        if undefended:
-            idx, attack_card = undefended
-            valid_defends = [c for c in game.player1_hand if game.can_beat(attack_card, c)]
-            if valid_defends:
-                status += f"\n🎯 Відбийте: {attack_card}"
-                keyboard = create_card_keyboard(valid_defends, f"defend_{idx}")
-            
-            keyboard_buttons = keyboard.inline_keyboard if keyboard else []
-            keyboard_buttons.append([InlineKeyboardButton(text="❌ Беру", callback_data="take_cards")])
-            keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-    
-    elif is_attacker and game.stage == "throw_in":
-        status += "🎲 **Можете підкинути**"
-        valid_cards = game.get_valid_attacks(game.player1_hand)
-        if valid_cards and len(game.table) < 6:
-            keyboard = create_card_keyboard(valid_cards, "throw")
-        
-        keyboard_buttons = keyboard.inline_keyboard if keyboard else []
-        keyboard_buttons.append([InlineKeyboardButton(text="✅ Закінчити підкидання", callback_data="end_throw")])
-        keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-    
-    await bot.send_message(chat_id, status, reply_markup=keyboard, parse_mode="Markdown")
-
-async def bot_move(chat_id, game):
-    await asyncio.sleep(1)
-    
-    is_bot_attacker = game.current_attacker != game.player1_id
-    
-    if is_bot_attacker and game.stage == "attack":
-        card = game.make_bot_move_smart(attacker=True)
-        if card:
-            game.player2_hand.remove(card)
-            game.table.append((card, None))
-            await send_game_state(chat_id, game, f"🤖 Бот атакує: {card}")
-            game.stage = "defend"
-        else:
-            await end_round(chat_id, game)
-    
-    elif not is_bot_attacker and game.stage == "defend":
-        result = game.make_bot_move_smart(attacker=False)
-        
-        if result == "all_defended":
-            await send_game_state(chat_id, game, "🤖 Бот відбився!")
-            game.stage = "throw_in"
-            game.current_attacker = game.player1_id
-        elif result is None:
-            for attack, defend in game.table:
-                game.player2_hand.append(attack)
-                if defend:
-                    game.player2_hand.append(defend)
-            game.table = []
-            game.current_attacker = game.player1_id
-            game.stage = "attack"
-            game.refill_hands()
-            
-            winner = game.game_over()
-            if winner:
-                await handle_game_over(chat_id, game, winner)
+try:
+    if data.startswith('card:'):
+        card = data.split(':', 1)[1]
+        # залежно від ролі — або атакуємо або захищаємо
+        if game.is_player_turn_attacker(user.id):
+            ok, msg = game.play_attack(user.id, card)
+            bot.answer_callback_query(call.id, msg)
+            # оновити повідомлення в чаті
+            bot.send_message(game.chat_id, f"🟢 {user.first_name} атакував картою {card}\n\nСтіл:\n{game.get_table_text()}")
+            # повідомити всіх учасників
+            notify_players_after_action(game)
+        elif game.is_player_turn_defender(user.id):
+            # якщо натиснув карту під час захисту — треба вказати яку атаку б'ємо
+            # якщо є незакриті атаки — дозволимо бити першу незакриту
+            pending = None
+            for a, d in game.table:
+                if d is None:
+                    pending = a
+                    break
+            if not pending:
+                bot.answer_callback_query(call.id, 'Немає відкритих атак для побиття')
+                return
+            ok, msg = game.play_defend(user.id, pending, card)
+            bot.answer_callback_query(call.id, msg)
+            if ok:
+                bot.send_message(game.chat_id, f"🛡️ {user.first_name} побив {pending} картoю {card}\n\nСтіл:\n{game.get_table_text()}")
+                notify_players_after_action(game)
             else:
-                await send_game_state(chat_id, game, "🤖 Бот взяв карти")
-                await bot_move(chat_id, game)
+                # Нічого не змінюємо
+                pass
         else:
-            idx, card = result
-            game.player2_hand.remove(card)
-            game.table[idx] = (game.table[idx][0], card)
-            await bot_move(chat_id, game)
-    
-    elif is_bot_attacker and game.stage == "throw_in":
-        card = game.make_bot_move_smart(attacker=True)
-        if card:
-            game.player2_hand.remove(card)
-            game.table.append((card, None))
-            await send_game_state(chat_id, game, f"🤖 Бот підкинув: {card}")
-            game.stage = "defend"
+            bot.answer_callback_query(call.id, 'Зараз не твоя дія для цієї кнопки')
+
+    elif data.startswith('action:'):
+        action = data.split(':', 1)[1]
+        if action == 'attack':
+            # показати руку атакуючому для вибору карти
+            p = game.get_player_by_id(user.id)
+            bot.answer_callback_query(call.id, 'Оберіть карту для атаки')
+            bot.send_message(user.id, f"🃏 Оберіть карту для атаки: {', '.join(p['hand'])}", reply_markup=hand_keyboard(p))
+        elif action == 'defend':
+            p = game.get_player_by_id(user.id)
+            bot.answer_callback_query(call.id, 'Оберіть карту для захисту')
+            bot.send_message(user.id, f"🃏 Оберіть карту для захисту: {', '.join(p['hand'])}", reply_markup=hand_keyboard(p))
+        elif action == 'take':
+            ok, msg = game.take_cards(user.id)
+            bot.answer_callback_query(call.id, msg)
+            if ok:
+                bot.send_message(game.chat_id, f"🟠 {user.first_name} взяв(ла) карти зі столу.")
+                # після взяття — добираємо карти і переходимо до наступного ходу
+                game.refill_all()
+                game.next_turn()
+                notify_players_after_action(game)
+        elif action == 'end_attack':
+            # завершення атаки — якщо всі карти побиті, переходимо; інакше — захисник має вибір
+            if game.all_attacks_beaten():
+                bot.answer_callback_query(call.id, 'Хід завершено — всі атаки побиті')
+                bot.send_message(game.chat_id, 'Хід завершено — всі атаки побиті. Добір карт...')
+                game.refill_all()
+                game.next_turn()
+                notify_players_after_action(game)
+            else:
+                bot.answer_callback_query(call.id, 'Не всі атаки побиті — захисник може брати або добивати')
+        elif action == 'hand':
+            p = game.get_player_by_id(user.id)
+            bot.answer_callback_query(call.id, 'Відкриваю руку')
+            bot.send_message(user.id, f"🃏 Твоя рука: {', '.join(p['hand'])}", reply_markup=hand_keyboard(p))
         else:
-            await end_round(chat_id, game)
+            bot.answer_callback_query(call.id, 'Невідома дія')
 
-async def end_round(chat_id, game):
-    game.table = []
-    game.refill_hands()
-    
-    winner = game.game_over()
-    if winner:
-        await handle_game_over(chat_id, game, winner)
-    else:
-        game.stage = "attack"
-        await send_game_state(chat_id, game, "✅ Раунд завершено")
-        if game.current_attacker != game.player1_id:
-            await bot_move(chat_id, game)
+except Exception as e:
+    logger.exception('Помилка в callback')
+    bot.answer_callback_query(call.id, 'Виникла помилка')
 
-async def handle_game_over(chat_id, game, winner_id):
-    user_stats = get_or_create_stats(game.player1_id, "Гравець")
-    
-    if winner_id == game.player1_id:
-        user_stats.win()
-        message = f"🎉 **Вітаємо! Ви перемогли!**\n\n⭐ Рейтинг: {user_stats.rating} (+25)\n"
-        if user_stats.wins == 1:
-            message += "\n🏅 **Нове досягнення:** Перша перемога!"
-        elif user_stats.wins == 10:
-            message += "\n🏅 **Нове досягнення:** Ветеран!"
-    else:
-        user_stats.lose()
-        message = f"😔 **Ви програли.**\n\n⭐ Рейтинг: {user_stats.rating} (-15)\n"
-    
-    message += f"\n📊 Статистика: {user_stats.wins}W / {user_stats.losses}L"
-    
-    keyboard = [
-        [InlineKeyboardButton(text="🔄 Нова гра", callback_data=f"bot_{game.difficulty}")],
-        [InlineKeyboardButton(text="🏠 Меню", callback_data="back_menu")]
-    ]
-    
-    await bot.send_message(chat_id, message, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard), parse_mode="Markdown")
-    del games[chat_id]
+def notify_players_after_action(game: DurakGame): # Оновити всім приватні повідомлення про руку і основне повідомлення у чаті try: # основний статус у групі status = f"Стіл:\n{game.get_table_text()}\n\nКозир: {game.trump_card}\nАтакує: {game.players[game.attacker_idx]['name']}\nЗахисник: {game.players[game.defender_idx]['name']}" bot.send_message(game.chat_id, status) except Exception: pass
 
-@dp.callback_query(F.data.startswith("attack_"))
-async def handle_attack(callback: types.CallbackQuery):
-    chat_id = callback.message.chat.id
-    if chat_id not in games:
-        await callback.answer("Гра не знайдена")
-        return
-    
-    game = games[chat_id]
-    card_idx = int(callback.data.split("_")[1])
-    valid_cards = game.get_valid_attacks(game.player1_hand)
-    
-    if card_idx < len(valid_cards):
-        card = valid_cards[card_idx]
-        game.player1_hand.remove(card)
-        game.table.append((card, None))
-        
-        await callback.message.delete()
-        game.stage = "defend"
-        await send_game_state(chat_id, game, f"⚔️ Ви атакували: {card}")
-        await bot_move(chat_id, game)
-    
-    await callback.answer()
+for p in game.players:
+    try:
+        hand_txt = f"🃏 Твоя рука: {', '.join(p['hand'])}\n\nСтіл:\n{game.get_table_text()}"
+        bot.send_message(p['id'], hand_txt, reply_markup=action_keyboard(game, p['id']))
+    except Exception:
+        # якщо не вдалося надіслати приватне — ігноруємо
+        pass
 
-@dp.callback_query(F.data.startswith("defend_"))
-async def handle_defend(callback: types.CallbackQuery):
-    chat_id = callback.message.chat.id
-    if chat_id not in games:
-        await callback.answer("Гра не знайдена")
-        return
-    
-    game = games[chat_id]
-    parts = callback.data.split("_")
-    table_idx = int(parts[1])
-    card_idx = int(parts[2])
-    
-    attack_card = game.table[table_idx][0]
-    valid_defends = [c for c in game.player1_hand if game.can_beat(attack_card, c)]
-    
-    if card_idx < len(valid_defends):
-        card = valid_defends[card_idx]
-        game.player1_hand.remove(card)
-        game.table[table_idx] = (attack_card, card)
-        
-        await callback.message.delete()
-        
-        all_defended = all(defend is not None for _, defend in game.table)
-        if all_defended:
-            game.stage = "throw_in"
-            await send_game_state(chat_id, game, f"🛡️ Ви відбилися: {card}")
-            await bot_move(chat_id, game)
-        else:
-            await send_game_state(chat_id, game, f"🛡️ Відбито: {card}")
-    
-    await callback.answer()
+Запуск
 
-@dp.callback_query(F.data == "take_cards")
-async def handle_take(callback: types.CallbackQuery):
-    chat_id = callback.message.chat.id
-    if chat_id not in games:
-        await callback.answer("Гра не знайдена")
-        return
-    
-    game = games[chat_id]
-    
-    for attack, defend in game.table:
-        game.player1_hand.append(attack)
-        if defend:
-            game.player1_hand.append(defend)
-    
-    game.table = []
-    game.current_attacker = game.player1_id
-    game.stage = "attack"
-    game.refill_hands()
-    
-    await callback.message.delete()
-    
-    winner = game.game_over()
-    if winner:
-        await handle_game_over(chat_id, game, winner)
-    else:
-        await send_game_state(chat_id, game, "📥 Ви взяли карти")
-        await bot_move(chat_id, game)
-    
-    await callback.answer()
-
-@dp.callback_query(F.data == "end_attack")
-async def handle_end_attack(callback: types.CallbackQuery):
-    chat_id = callback.message.chat.id
-    if chat_id not in games:
-        await callback.answer("Гра не знайдена")
-        return
-    
-    game = games[chat_id]
-    await callback.message.delete()
-    
-    if not game.table:
-        await send_game_state(chat_id, game, "Спочатку зробіть хід!")
-    else:
-        game.stage = "defend"
-        await send_game_state(chat_id, game)
-        await bot_move(chat_id, game)
-    
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("throw_"))
-async def handle_throw(callback: types.CallbackQuery):
-    chat_id = callback.message.chat.id
-    if chat_id not in games:
-        await callback.answer("Гра не знайдена")
-        return
-    
-    game = games[chat_id]
-    card_idx = int(callback.data.split("_")[1])
-    valid_cards = game.get_valid_attacks(game.player1_hand)
-    
-    if card_idx < len(valid_cards):
-        card = valid_cards[card_idx]
-        game.player1_hand.remove(card)
-        game.table.append((card, None))
-        
-        await callback.message.delete()
-        game.stage = "defend"
-        await send_game_state(chat_id, game, f"🎲 Ви підкинули: {card}")
-        await bot_move(chat_id, game)
-    
-    await callback.answer()
-
-@dp.callback_query(F.data == "end_throw")
-async def handle_end_throw(callback: types.CallbackQuery):
-    chat_id = callback.message.chat.id
-    if chat_id not in games:
-        await callback.answer("Гра не знайдена")
-        return
-    
-    game = games[chat_id]
-    await callback.message.delete()
-    await end_round(chat_id, game)
-    await callback.answer()
-
-async def main():
-    print("🤖 Покращений бот 'Дурак' запущено!")
-    print("✅ Функції: статистика, рейтинг, досягнення, 3 рівні складності")
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+if name == 'main': logger.info('Бот запущено (polling)') try: bot.infinity_polling(timeout=60, long_polling_timeout=60) except KeyboardInterrupt: logger.info('Зупинка користувачем') except Exception: logger.exception('Критична помилка')
