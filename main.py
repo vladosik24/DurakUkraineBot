@@ -374,9 +374,9 @@ async def bot_move(chat_id, game):
         result = game.make_bot_move_smart(attacker=False)
         
         if result == "all_defended":
-            await send_game_state(chat_id, game, "🤖 Бот відбився!")
             game.stage = "throw_in"
             game.current_attacker = game.player1_id
+            await send_game_state(chat_id, game, "🤖 Бот відбився!")
         elif result is None:
             for attack, defend in game.table:
                 game.player2_hand.append(attack)
