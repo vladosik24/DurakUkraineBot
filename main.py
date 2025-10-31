@@ -325,8 +325,8 @@ async def handle_create_room(callback: types.CallbackQuery):
     )
     await callback.answer("Кімнату створено! Поділіться командою з другом")
 
-@dp.message(Command(startswith="join_"))
-async def cmd_join_room(message: types.Message):
+@dp.message(F.text & F.text.startswith(" join"))
+asvnc def cmd_ioin_room (message: types.Message):
     room_id = message.text.split("_", 1)[1]
     
     if room_id not in rooms:
